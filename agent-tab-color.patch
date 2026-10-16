@@ -1,0 +1,298 @@
+diff --git a/src/session/Session.cpp b/src/session/Session.cpp
+index 8f09bf7..4e45cd1 100644
+--- a/src/session/Session.cpp
++++ b/src/session/Session.cpp
+@@ -2039,6 +2039,11 @@ QString Session::foregroundProcessName()
+     return name;
+ }
+ 
++int Session::foregroundProcessGroupId() const
++{
++    return _shellProcess ? _shellProcess->foregroundProcessGroup() : -1;
++}
++
+ void Session::saveSession(KConfigGroup &group)
+ {
+     group.writePathEntry("WorkingDir", currentWorkingDirectory());
+diff --git a/src/session/Session.h b/src/session/Session.h
+index d665d97..e17bebc 100644
+--- a/src/session/Session.h
++++ b/src/session/Session.h
+@@ -343,6 +343,9 @@ public:
+     /** Returns the name of the current foreground process. */
+     QString foregroundProcessName();
+ 
++    /** Returns the process group id of the current foreground process, -1 if unavailable. */
++    int foregroundProcessGroupId() const;
++
+     /** Returns the terminal session's window size in lines and columns. */
+     QSize size();
+     /**
+diff --git a/src/session/SessionController.cpp b/src/session/SessionController.cpp
+index dba344f..78f2173 100644
+--- a/src/session/SessionController.cpp
++++ b/src/session/SessionController.cpp
+@@ -81,6 +81,7 @@
+ 
+ #include "SessionGroup.h"
+ #include "SessionManager.h"
++#include "KonsoleSettings.h"
+ 
+ #include "widgets/EditProfileDialog.h"
+ #include "widgets/IncrementalSearchBar.h"
+@@ -92,6 +93,10 @@
+ // For Unix signal names
+ #include <csignal>
+ 
++#include <QDirIterator>
++#include <QFile>
++#include <QFileInfo>
++
+ using namespace Konsole;
+ 
+ QSet<SessionController *> SessionController::_allControllers;
+@@ -113,6 +118,7 @@ SessionController::SessionController(Session *sessionParam, TerminalDisplay *vie
+     , _findNextAction(nullptr)
+     , _findPreviousAction(nullptr)
+     , _interactionTimer(nullptr)
++    , _agentWatchTimer(nullptr)
+     , _searchStartLine(0)
+     , _prevSearchResultLine(0)
+     , _codecAction(nullptr)
+@@ -217,6 +223,13 @@ SessionController::SessionController(Session *sessionParam, TerminalDisplay *vie
+     _interactionTimer->setSingleShot(true);
+     _interactionTimer->setInterval(2000);
+     connect(_interactionTimer, &QTimer::timeout, this, &Konsole::SessionController::snapshot);
++
++    // periodically color the tab while an AI agent runs in this session
++    _agentWatchTimer = new QTimer(this);
++    _agentWatchTimer->setInterval(1000);
++    connect(_agentWatchTimer, &QTimer::timeout, this, &Konsole::SessionController::updateAgentTabColor);
++    _agentWatchTimer->start();
++    QTimer::singleShot(0, this, &Konsole::SessionController::updateAgentTabColor);
+     connect(view(), &Konsole::TerminalDisplay::compositeFocusChanged, this, [this](bool focused) {
+         if (focused) {
+             interactionHandler();
+@@ -312,6 +325,7 @@ void SessionController::viewFocusChangeHandler(bool focused)
+ 
+ void SessionController::interactionHandler()
+ {
++    updateAgentTabColor();
+     if (!_interactionTimer->isActive()) {
+         _interactionTimer->start();
+     }
+@@ -374,6 +388,144 @@ void SessionController::snapshot()
+     updateSessionIcon();
+ }
+ 
++static bool tokenMatchesAgentName(const QString &token, const QStringList &agents)
++{
++    const QString t = token.trimmed();
++    if (t.isEmpty()) {
++        return false;
++    }
++    for (const QString &agent : agents) {
++        if (agent.isEmpty()) {
++            continue;
++        }
++        if (t.compare(agent, Qt::CaseInsensitive) == 0) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool cmdlineMatchesAgent(const QByteArray &rawCmdline, const QStringList &agents)
++{
++    if (rawCmdline.isEmpty()) {
++        return false;
++    }
++    const QList<QByteArray> parts = rawCmdline.split('\0');
++    if (!parts.isEmpty() && !parts.at(0).isEmpty()) {
++        const QString exeBase = QFileInfo(QString::fromLocal8Bit(parts.at(0))).fileName();
++        if (tokenMatchesAgentName(exeBase, agents)) {
++            return true;
++        }
++    }
++    const QString cmd = QString::fromLocal8Bit(rawCmdline.constData(), rawCmdline.size()).toLower().replace(QLatin1Char('\0'), QLatin1Char(' '));
++    for (const QString &agent : agents) {
++        const QString a = agent.trimmed().toLower();
++        if (a.isEmpty()) {
++            continue;
++        }
++        // Cursor's CLI sets comm to "MainThread"; match the real binary in cmdline.
++        if (a == QLatin1String("agent")) {
++            if (cmd.contains(QLatin1String("/agent")) || cmd.contains(QLatin1String("bin/agent"))) {
++                return true;
++            }
++            continue;
++        }
++        if (a.size() <= 3) {
++            continue;
++        }
++        if (cmd.contains(a)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool processMatchesAgent(int pid, const QStringList &agents)
++{
++    QFile statFile(QStringLiteral("/proc/") + QString::number(pid) + QStringLiteral("/stat"));
++    if (statFile.open(QIODevice::ReadOnly)) {
++        const QByteArray data = statFile.readAll();
++        const int start = data.indexOf('(');
++        const int end = data.lastIndexOf(')');
++        if (start >= 0 && end > start) {
++            if (tokenMatchesAgentName(QString::fromLatin1(data.mid(start + 1, end - start - 1)), agents)) {
++                return true;
++            }
++        }
++    }
++    QFile cmdFile(QStringLiteral("/proc/") + QString::number(pid) + QStringLiteral("/cmdline"));
++    if (cmdFile.open(QIODevice::ReadOnly)) {
++        return cmdlineMatchesAgent(cmdFile.readAll(), agents);
++    }
++    return false;
++}
++
++// Any process in the foreground process group (wrappers, node workers, MCP children).
++static bool isAgentInProcessGroup(int pgid, const QStringList &agents)
++{
++    QDirIterator it(QStringLiteral("/proc"), {QStringLiteral("[0-9]*")}, QDir::Dirs);
++    while (it.hasNext()) {
++        const QString path = it.next();
++        const int pid = path.mid(path.lastIndexOf(QLatin1Char('/')) + 1).toInt();
++        if (pid <= 0) {
++            continue;
++        }
++        QFile statFile(path + QStringLiteral("/stat"));
++        if (!statFile.open(QIODevice::ReadOnly)) {
++            continue;
++        }
++        const QByteArray data = statFile.readAll();
++        const int end = data.lastIndexOf(')');
++        const QList<QByteArray> fields = data.mid(end + 2).split(' ');
++        if (fields.size() >= 3 && fields.at(2).toInt() == pgid && processMatchesAgent(pid, agents)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void SessionController::updateAgentTabColor()
++{
++    if (session().isNull() || !KonsoleSettings::agentDetectionEnabled()) {
++        return;
++    }
++
++    QStringList agents;
++    const auto entries = KonsoleSettings::agentProcessNames().split(QLatin1Char(','), Qt::SkipEmptyParts);
++    for (const QString &entry : entries) {
++        agents.append(entry.trimmed());
++    }
++
++    bool running = false;
++    if (!agents.isEmpty()) {
++        const int pgid = session()->foregroundProcessGroupId();
++        if (pgid != -1) {
++            running = isAgentInProcessGroup(pgid, agents);
++        }
++        if (!running) {
++            const int fpid = session()->foregroundProcessId();
++            if (fpid > 0) {
++                running = processMatchesAgent(fpid, agents);
++            }
++        }
++        if (!running) {
++            running = tokenMatchesAgentName(session()->foregroundProcessName(), agents);
++        }
++    }
++
++    if (session()->isTabColorSetByUser()) {
++        return; // never override a color the user picked manually
++    }
++    const Profile::Ptr profile = SessionManager::instance()->sessionProfile(session());
++    const QColor target = running ? KonsoleSettings::agentTabColor() : (profile ? profile->tabColor() : QColor());
++    if (session()->color() != target) {
++        session()->setColor(target);
++    }
++    if (color() != target) {
++        setColor(target);
++    }
++}
++
+ QString SessionController::currentDir() const
+ {
+     return session()->currentWorkingDirectory();
+diff --git a/src/session/SessionController.h b/src/session/SessionController.h
+index 5e73e3c..556ec4b 100644
+--- a/src/session/SessionController.h
++++ b/src/session/SessionController.h
+@@ -323,6 +323,8 @@ private Q_SLOTS:
+     // to take a snapshot of the state of the
+     // foreground process in the terminal
+ 
++    void updateAgentTabColor(); // colors the tab while an AI agent runs in the foreground
++
+     void highlightMatches(bool highlight);
+     void scrollBackOptionsChanged(int mode, int lines);
+     void sessionResizeRequest(const QSize &size);
+@@ -383,6 +385,7 @@ private:
+     QAction *_findPreviousAction;
+ 
+     QTimer *_interactionTimer;
++    QTimer *_agentWatchTimer;
+ 
+     int _searchStartLine;
+     int _prevSearchResultLine;
+diff --git a/src/settings/konsole.kcfg b/src/settings/konsole.kcfg
+index 42fbfd0..6a3c3b2 100644
+--- a/src/settings/konsole.kcfg
++++ b/src/settings/konsole.kcfg
+@@ -218,4 +218,18 @@
+       <default></default>
+     </entry>
+   </group>
++  <group name="AgentDetection">
++    <entry name="AgentDetectionEnabled" type="Bool">
++      <label>Color tabs that are running an AI agent</label>
++      <default>true</default>
++    </entry>
++    <entry name="AgentTabColor" type="Color">
++      <label>Background color for tabs running an AI agent</label>
++      <default>#ffff00</default>
++    </entry>
++    <entry name="AgentProcessNames" type="String">
++      <label>Comma separated process names treated as AI agents</label>
++      <default>claude,cursor,cursor-agent,cursor-cli,opencode,pi,agy,agent,codex,aider,goose,amp,ollama,gemini</default>
++    </entry>
++  </group>
+ </kcfg>
+diff --git a/src/widgets/DetachableTabBar.cpp b/src/widgets/DetachableTabBar.cpp
+index 4863777..cacf3e7 100644
+--- a/src/widgets/DetachableTabBar.cpp
++++ b/src/widgets/DetachableTabBar.cpp
+@@ -156,6 +156,21 @@ void DetachableTabBar::dragMoveEvent(QDragMoveEvent *event)
+ 
+ void DetachableTabBar::paintEvent(QPaintEvent *event)
+ {
++    QPainter backgroundPainter(this);
++    backgroundPainter.setPen(Qt::NoPen);
++    for (int tabIndex = 0; tabIndex < count(); tabIndex++) {
++        const QVariant data = tabData(tabIndex);
++        if (!data.isValid() || data.isNull()) {
++            continue;
++        }
++        QColor varColor = data.value<QColor>();
++        if (!varColor.isValid() || varColor.alpha() == 0) {
++            continue;
++        }
++        varColor.setAlpha(235);
++        backgroundPainter.fillRect(tabRect(tabIndex), varColor);
++    }
++
+     QTabBar::paintEvent(event);
+     if (!event->isAccepted()) {
+         return; // Reduces repainting
