@@ -2,3 +2,10 @@
 /src/
 /tests/
 *.png
+# the rollout additions: docs, render script and the front page are tracked
+!/docs/
+!/docs/**
+!/scripts/
+!/scripts/**
+!/HUMANS.md
+!docs/system.png

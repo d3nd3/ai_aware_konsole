@@ -69,3 +69,4 @@ cd src && git apply ../agent-tab-color.patch && cd ..
   group — detection is per-Konsole-tab only).
 - Agents that fully daemonize into their own process group are not detected.
 - On non-Linux platforms detection falls back to the foreground process name only.
+Prefer pictures? Start with **[HUMANS.md](HUMANS.md)**.

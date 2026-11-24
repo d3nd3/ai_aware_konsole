@@ -1,0 +1,79 @@
+# ai-aware-konsole — thin fork of KDE Konsole: one patch colours the tab of a
+# session whose foreground process group contains an AI agent.
+# The Konsole tree it patches lives in src/ and is gitignored; the fork surface
+# is README + agent-tab-color.patch + 4 touched files.
+# Strokes only in the style classes so light and dark both stay readable.
+
+title: |md
+  # ai-aware-konsole
+  Konsole fork whose tab turns yellow while an AI agent runs in that tab.
+| {near: top-center}
+
+direction: right
+grid-columns: 2
+grid-rows: 2
+
+entry: Entry points {
+  direction: down
+
+  bin: cmake -S src -B build → install to dot-local/bin/konsole
+  tabs: DetachableTabBar · one tab per session, title area is the only UI touched
+  hook: viewFocusChangeHandler · refreshes on focus change, alongside the timer
+  cfg: konsolerc, group AgentDetection · enabled switch, tab colour, process-name list
+}
+
+state: State {
+  direction: down
+
+  proc: proc/pid/stat + cmdline {
+    shape: cylinder
+  }
+  colour: Session::color + tab data variant {
+    shape: cylinder
+  }
+  manual: isTabColorSetByUser · a colour picked in Rename Tab is never overridden {
+    style.stroke-dash: 4
+  }
+  fallback: profile tabColor · the value restored when the agent leaves
+}
+
+core: Core · watcher {
+  direction: down
+
+  ctl: SessionController · owns _agentWatchTimer at 1000 ms (README still says 2 s) plus one shot at 0
+  pgid: Session::foregroundProcessGroupId · tcgetpgrp on the tab pty, -1 when unavailable
+  scan: isAgentInProcessGroup · walks the procfs root, keeps pids whose stat field 3 equals the pgid
+  match: processMatchesAgent · comm substring rule first, then cmdline heuristics
+  tokens: name matcher · comm must match exactly, cmdline only for names longer than 3 chars, plus an agent carve-out for cursor's MainThread comm
+  apply: updateAgentTabColor · sets session and controller colour only when it differs
+  paint: paintEvent · fills each tabRect with the tab colour variant at alpha 235, then paints
+}
+
+external: External {
+  direction: down
+
+  kern: kernel · pty foreground process group + live procfs table
+  agents: agent processes · claude, opencode, codex, pi, agy, and their node or npx wrappers
+  konsole: KDE Konsole v25.12.3 · upstream tree vendored in the gitignored src
+  blind: tmux and screen · they own the pty foreground group, so nested agents stay invisible {
+    style.stroke-dash: 4
+  }
+  runtime: Qt 6.10 + KF6 6.24 · the stack the patch was verified against on Ubuntu 26.04
+}
+
+entry -> core: tab + 1 s tick + settings
+core -> state: colour writes · proc reads
+core -> external: scans pids · needs the pty pgid
+
+# style classes keep only strokes: no hardcoded fills that break dark mode
+classes: {
+  entry: {style: {stroke: "#6a9fb5"; stroke-width: 2}}
+  core: {style: {stroke: "#c9a227"; stroke-width: 2}}
+  state: {style: {stroke: "#8fbf6f"; stroke-width: 2}}
+  external: {style: {stroke: "#b07cc6"; stroke-width: 2}}
+}
+
+entry.class: entry
+core.class: core
+state.class: state
+external.class: external
